@@ -1,0 +1,1276 @@
+-- FPS Optimizer v3 | executor script
+-- Tap the round bubble (or press RightShift) to open / close the window.
+-- Drag the bubble or the window header to move them. F6 turns 3D back on if Pause 3D is active.
+--
+--   * every change is remembered and fully undone when a toggle is switched off or the window is closed
+--   * background work shares one small per-frame time budget that shrinks by itself when the game lags
+--   * memory cleanup is incremental and rate limited, never a forced full collect
+--   * Beams and Highlights are never touched, so ESP / line features of other scripts keep working
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local Stats = game:GetService("Stats")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local TOUCH = UIS.TouchEnabled
+
+if getgenv and getgenv().__FPSOPT then
+	pcall(getgenv().__FPSOPT)
+end
+
+local closed = false
+local connections = {}
+
+---------------------------------------------------------------- theme
+local C = {
+	bg = Color3.fromRGB(17, 18, 23),
+	bar = Color3.fromRGB(24, 25, 33),
+	row = Color3.fromRGB(27, 28, 37),
+	rowOn = Color3.fromRGB(36, 38, 74),
+	rowHover = Color3.fromRGB(34, 35, 46),
+	stroke = Color3.fromRGB(48, 50, 66),
+	text = Color3.fromRGB(230, 232, 242),
+	dim = Color3.fromRGB(124, 128, 148),
+	accent = Color3.fromRGB(104, 112, 255),
+	good = Color3.fromRGB(80, 200, 130),
+	warn = Color3.fromRGB(240, 190, 80),
+	bad = Color3.fromRGB(235, 90, 90),
+	off = Color3.fromRGB(56, 58, 74),
+}
+
+---------------------------------------------------------------- saved settings
+local FILE = "FPSOptimizer_v3.json"
+local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+local saved = {
+	states = {},
+	cap = 120,
+	window = { 0.12, 0.28 },
+	bubble = { 0.012, 0.42 },
+	open = true,
+}
+
+if canFile then
+	pcall(function()
+		if isfile(FILE) then
+			local data = HttpService:JSONDecode(readfile(FILE))
+			if type(data) == "table" then
+				for k, v in pairs(data) do
+					if saved[k] ~= nil and type(v) == type(saved[k]) then
+						saved[k] = v
+					end
+				end
+			end
+		end
+	end)
+end
+
+local saveQueued = false
+local snapshotStates -- filled in once the features exist
+
+local function saveSoon()
+	if not canFile or saveQueued or closed then
+		return
+	end
+	saveQueued = true
+	task.delay(0.6, function()
+		saveQueued = false
+		if snapshotStates then
+			snapshotStates()
+		end
+		pcall(writefile, FILE, HttpService:JSONEncode(saved))
+	end)
+end
+
+---------------------------------------------------------------- gui helpers
+local function new(class, props, parent)
+	local obj = Instance.new(class)
+	for k, v in pairs(props) do
+		pcall(function()
+			obj[k] = v
+		end)
+	end
+	obj.Parent = parent
+	return obj
+end
+
+local function round(obj, r)
+	return new("UICorner", {
+		CornerRadius = typeof(r) == "UDim" and r or UDim.new(0, r),
+	}, obj)
+end
+
+local function outline(obj, color, transparency, thickness)
+	return new("UIStroke", {
+		Color = color,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		LineJoinMode = Enum.LineJoinMode.Round,
+	}, obj)
+end
+
+local function tween(obj, t, props)
+	TweenService:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+---------------------------------------------------------------- frame budget
+-- All background work shares this small slice of every frame. If the game is
+-- already struggling the slice shrinks, so the optimizer never piles on lag.
+local frameDt = 1 / 60
+
+local function budget()
+	if frameDt > 1 / 25 then
+		return 0.0012
+	elseif frameDt > 1 / 45 then
+		return 0.0025
+	end
+	return 0.004
+end
+
+---------------------------------------------------------------- state store
+-- originals are kept per property in weak tables (one small entry per changed
+-- object, and entries vanish by themselves when an object is destroyed)
+local WEAK_K = { __mode = "k" }
+
+local function getProp(inst, prop)
+	return inst[prop]
+end
+
+local function putProp(inst, prop, value)
+	inst[prop] = value
+end
+
+local function makeSet(def)
+	return function(inst, prop, value)
+		local ok, cur = pcall(getProp, inst, prop)
+		if not ok or cur == value then
+			return
+		end
+		local map = def.store[prop]
+		if not map then
+			map = setmetatable({}, WEAK_K)
+			def.store[prop] = map
+		end
+		if map[inst] == nil then
+			map[inst] = cur
+		end
+		pcall(putProp, inst, prop, value)
+	end
+end
+
+-- puts everything back, spread over many frames so closing a feature never hitches
+local function restoreAsync(store, done)
+	task.spawn(function()
+		local t0 = os.clock()
+		for prop, map in pairs(store) do
+			for inst, old in pairs(map) do
+				pcall(putProp, inst, prop, old)
+				map[inst] = nil
+				if os.clock() - t0 > budget() then
+					task.wait()
+					t0 = os.clock()
+				end
+			end
+			store[prop] = nil
+		end
+		if done then
+			done()
+		end
+	end)
+end
+
+---------------------------------------------------------------- memory helpers
+local function totalMb()
+	local ok, mb = pcall(function()
+		return Stats:GetTotalMemoryUsageMb()
+	end)
+	return ok and mb or 0
+end
+
+local function luaMb()
+	local ok, kb = pcall(collectgarbage, "count")
+	return ok and kb / 1024 or 0
+end
+
+-- one garbage-collection cycle done in tiny steps over many frames (no big stall).
+-- returns false when the environment does not allow stepping.
+local function gentleGC(maxSeconds)
+	local started, slice = os.clock(), os.clock()
+	for _ = 1, 800 do
+		local ok, finished = pcall(collectgarbage, "step", 48)
+		if not ok then
+			return false
+		end
+		if finished then
+			return true
+		end
+		if os.clock() - slice > 0.0015 then
+			task.wait()
+			slice = os.clock()
+		end
+		if os.clock() - started > (maxSeconds or 4) then
+			break
+		end
+	end
+	return true
+end
+
+-- short message shown in the header (auto actions, results)
+local note, noteUntil, hint = "", 0, ""
+local function notify(text)
+	note = text
+	noteUntil = os.clock() + 6
+end
+
+---------------------------------------------------------------- features
+local features, handlerDefs = {}, {}
+local originalQuality, originalFps
+local activeHandlers = 0
+local FPS_CAPS = { 30, 60, 90, 120, 144, 240 }
+
+local function feature(def)
+	def.store = {}
+	def.active = false
+	def.restoring = false
+	def.set = makeSet(def)
+	table.insert(features, def)
+	if def.handler then
+		table.insert(handlerDefs, def)
+	end
+	return def
+end
+
+local NO_LIFETIME = NumberRange.new(0)
+
+local shadows = feature({
+	name = "Shadows off",
+	desc = "Turns off all shadows",
+	handler = function(inst, set)
+		if inst:IsA("BasePart") then
+			set(inst, "CastShadow", false)
+		elseif inst:IsA("Light") then
+			set(inst, "Shadows", false)
+		elseif inst == Lighting then
+			set(inst, "GlobalShadows", false)
+			set(inst, "ShadowSoftness", 0)
+		end
+	end,
+})
+
+local effects = feature({
+	name = "Clear effects",
+	desc = "Particles, trails, fire, smoke, post effects",
+	handler = function(inst, set)
+		if inst:IsA("ParticleEmitter") then
+			set(inst, "Enabled", false)
+			set(inst, "Lifetime", NO_LIFETIME) -- also stops :Emit() bursts
+		elseif inst:IsA("Trail") or inst:IsA("Fire") or inst:IsA("Smoke")
+			or inst:IsA("Sparkles") or inst:IsA("PostEffect") or inst:IsA("Clouds") then
+			set(inst, "Enabled", false)
+		elseif inst:IsA("Explosion") then
+			set(inst, "Visible", false)
+		elseif inst:IsA("Atmosphere") then
+			set(inst, "Density", 0)
+			set(inst, "Haze", 0)
+		end
+		-- Beam and Highlight are left alone on purpose (ESP / line features use them)
+	end,
+})
+
+local lights = feature({
+	name = "Lights off",
+	desc = "Turns off point, spot and surface lights",
+	handler = function(inst, set)
+		if inst:IsA("Light") then
+			set(inst, "Enabled", false)
+		end
+	end,
+})
+
+local materials = feature({
+	name = "Simple materials",
+	desc = "Plain materials, flat water",
+	handler = function(inst, set)
+		if inst:IsA("Terrain") then
+			set(inst, "WaterWaveSize", 0)
+			set(inst, "WaterWaveSpeed", 0)
+			set(inst, "WaterReflectance", 0)
+			set(inst, "Decoration", false)
+		elseif inst:IsA("BasePart") then
+			set(inst, "Material", Enum.Material.SmoothPlastic)
+			set(inst, "Reflectance", 0)
+		end
+	end,
+})
+
+local textures = feature({
+	name = "Strip textures",
+	desc = "Removes textures (big memory saver)",
+	handler = function(inst, set)
+		if inst:IsA("MeshPart") then
+			set(inst, "TextureID", "")
+		elseif inst:IsA("SurfaceAppearance") then
+			set(inst, "ColorMap", "")
+			set(inst, "NormalMap", "")
+			set(inst, "MetalnessMap", "")
+			set(inst, "RoughnessMap", "")
+		elseif inst:IsA("SpecialMesh") then
+			set(inst, "TextureId", "")
+		elseif inst:IsA("Decal") or inst:IsA("Texture") then
+			set(inst, "Texture", "")
+		end
+	end,
+})
+
+local meshDetail = feature({
+	name = "Low mesh detail",
+	desc = "Cheaper mesh rendering",
+	handler = function(inst, set)
+		if inst:IsA("TriangleMeshPart") then
+			set(inst, "RenderFidelity", Enum.RenderFidelity.Performance)
+		end
+	end,
+})
+
+-- other players' characters are hidden locally (only you see the change)
+local hideConns = {}
+local hidePlayers
+local function hideInstance(inst)
+	if not hidePlayers.active then
+		return
+	end
+	if inst:IsA("BasePart") then
+		hidePlayers.set(inst, "LocalTransparencyModifier", 1)
+	elseif inst:IsA("Decal") then
+		hidePlayers.set(inst, "Transparency", 1)
+	elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") then
+		hidePlayers.set(inst, "Enabled", false)
+	end
+end
+
+local function hideCharacter(char)
+	if not char or char == player.Character then
+		return
+	end
+	for _, inst in ipairs(char:GetDescendants()) do
+		hideInstance(inst)
+	end
+	table.insert(hideConns, char.DescendantAdded:Connect(hideInstance))
+end
+
+local function hookPlayer(p)
+	if p == player then
+		return
+	end
+	if p.Character then
+		task.spawn(hideCharacter, p.Character)
+	end
+	table.insert(hideConns, p.CharacterAdded:Connect(function(char)
+		task.defer(hideCharacter, char)
+	end))
+end
+
+hidePlayers = feature({
+	name = "Hide players",
+	desc = "Hides other players (only for you)",
+	usesStore = true,
+	on = function()
+		for _, p in ipairs(Players:GetPlayers()) do
+			hookPlayer(p)
+		end
+		table.insert(hideConns, Players.PlayerAdded:Connect(hookPlayer))
+	end,
+	off = function()
+		for _, c in ipairs(hideConns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+		table.clear(hideConns)
+	end,
+})
+
+-- hides small anchored parts far from the camera. Only parts that really are
+-- static decoration are tracked, and the work is spread over many frames.
+local CULL_RANGE = 260
+local cullList, cullSet, cullCursor = {}, {}, 1
+local cullHidden = setmetatable({}, WEAK_K)
+
+local cull
+cull = feature({
+	name = "Cull far objects",
+	desc = "Hides small far away parts",
+	handler = function(inst, set)
+		if cullSet[inst] or not inst:IsA("BasePart") or inst:IsA("Terrain") then
+			return
+		end
+		if inst.Anchored and inst.Transparency < 1 and inst.Size.Magnitude < 100 then
+			local char = player.Character
+			if not (char and inst:IsDescendantOf(char)) then
+				cullSet[inst] = true
+				cullList[#cullList + 1] = inst
+			end
+		end
+	end,
+	off = function()
+		table.clear(cullList)
+		table.clear(cullSet)
+		table.clear(cullHidden)
+		cullCursor = 1
+	end,
+})
+
+local function pumpCull(deadline)
+	if not cull.active then
+		return
+	end
+	local cam = Workspace.CurrentCamera
+	local n = #cullList
+	if not cam or n == 0 then
+		return
+	end
+	local origin = cam.CFrame.Position
+	local hideSq = CULL_RANGE * CULL_RANGE
+	local showSq = (CULL_RANGE * 0.9) * (CULL_RANGE * 0.9)
+	local i, steps = cullCursor, 0
+	local maxSteps = math.min(n, 3000)
+	while steps < maxSteps and n > 0 do
+		if i > n then
+			i = 1
+		end
+		local part = cullList[i]
+		if part.Parent == nil then
+			-- destroyed: swap-remove so the list never grows stale
+			cullSet[part] = nil
+			cullHidden[part] = nil
+			cullList[i] = cullList[n]
+			cullList[n] = nil
+			n -= 1
+		else
+			local d = part.Position - origin
+			local distSq = d.X * d.X + d.Y * d.Y + d.Z * d.Z
+			if cullHidden[part] then
+				if distSq < showSq then
+					cull.set(part, "LocalTransparencyModifier", 0)
+					cullHidden[part] = nil
+				end
+			elseif distSq > hideSq then
+				cull.set(part, "LocalTransparencyModifier", 1)
+				cullHidden[part] = true
+			end
+			i += 1
+		end
+		steps += 1
+		if steps % 64 == 0 and os.clock() > deadline then
+			break
+		end
+	end
+	cullCursor = i
+end
+
+local lowest = feature({
+	name = "Lowest graphics",
+	desc = "Quality level 1",
+	on = function()
+		pcall(function()
+			local r = settings().Rendering
+			originalQuality = originalQuality or r.QualityLevel
+			r.QualityLevel = Enum.QualityLevel.Level01
+		end)
+	end,
+	off = function()
+		pcall(function()
+			if originalQuality then
+				settings().Rendering.QualityLevel = originalQuality
+			end
+		end)
+	end,
+})
+
+local function applyCap()
+	if setfpscap then
+		pcall(setfpscap, saved.cap)
+	end
+end
+
+local fpsCap = feature({
+	name = "FPS cap",
+	desc = "Applies the cap shown on the right",
+	on = function()
+		if setfpscap then
+			if originalFps == nil then
+				originalFps = 60
+				if getfpscap then
+					local ok, v = pcall(getfpscap)
+					if ok and tonumber(v) and v > 0 then
+						originalFps = v
+					end
+				end
+			end
+			applyCap()
+		end
+	end,
+	off = function()
+		if setfpscap then
+			pcall(setfpscap, originalFps or 60)
+		end
+	end,
+})
+
+local pause3d = feature({
+	name = "Pause 3D",
+	desc = "Stops drawing the world (AFK). F6 turns it back on",
+	on = function()
+		pcall(function()
+			RunService:Set3dRenderingEnabled(false)
+		end)
+	end,
+	off = function()
+		pcall(function()
+			RunService:Set3dRenderingEnabled(true)
+		end)
+	end,
+})
+
+---------------------------------------------------------------- auto memory guard
+-- Keeps an eye on memory and acts gently:
+--   1. when the Lua heap has grown a lot, one incremental garbage-collection cycle (rate limited)
+--   2. when total memory gets close to the crash zone, turns on the next memory saver, one at a time
+-- It never runs while the game is lagging, and it undoes its own changes when switched off.
+local TOTAL_LIMIT_MB = TOUCH and 1500 or 3500
+local memoryLadder = { effects, meshDetail, textures } -- least visual impact first
+local autoEnabled = {}
+local setFeature
+
+local autoMem
+autoMem = feature({
+	name = "Auto memory",
+	desc = "Cleans memory by itself, enables savers when low",
+	on = function()
+		task.spawn(function()
+			local lastClean, lastStep = os.clock(), 0
+			local baseLua = luaMb()
+			while autoMem.active and not closed do
+				task.wait(10)
+				if not autoMem.active or closed then
+					break
+				end
+				if frameDt < 1 / 20 then
+					local now = os.clock()
+					local lua = luaMb()
+					if lua > 150 and lua > baseLua * 1.4 and now - lastClean > 90 then
+						gentleGC(3)
+						lastClean = now
+						baseLua = luaMb()
+					end
+					if totalMb() > TOTAL_LIMIT_MB * 0.85 and now - lastStep > 40 then
+						for _, def in ipairs(memoryLadder) do
+							if not def.active and not def.restoring then
+								setFeature(def, true)
+								autoEnabled[def] = true
+								lastStep = now
+								notify("Auto: " .. def.name)
+								break
+							end
+						end
+					end
+				end
+			end
+		end)
+	end,
+	off = function()
+		for def in pairs(autoEnabled) do
+			setFeature(def, false)
+		end
+		table.clear(autoEnabled)
+	end,
+})
+
+function snapshotStates()
+	for _, def in ipairs(features) do
+		if def ~= pause3d then
+			saved.states[def.name] = def.active and not autoEnabled[def] or false
+		end
+	end
+end
+
+---------------------------------------------------------------- engine
+local roots = { Workspace, Lighting }
+
+-- new instances are queued and handled inside the frame budget
+local queue, qHead, qTail = {}, 1, 0
+local QUEUE_MAX = 30000
+local needRescan = false
+
+local scan = { active = false, stack = {}, list = {} }
+
+local function requestScan()
+	table.clear(scan.list)
+	for _, def in ipairs(handlerDefs) do
+		if def.active then
+			scan.list[#scan.list + 1] = def
+		end
+	end
+	if #scan.list == 0 then
+		scan.active = false
+		return
+	end
+	table.clear(scan.stack)
+	for i = #roots, 1, -1 do
+		scan.stack[#scan.stack + 1] = roots[i]
+	end
+	scan.active = true
+end
+
+local function runHandlers(inst)
+	for i = 1, #handlerDefs do
+		local def = handlerDefs[i]
+		if def.active then
+			pcall(def.handler, inst, def.set)
+		end
+	end
+end
+
+local function pumpQueue(deadline)
+	local n = 0
+	while qHead <= qTail do
+		local inst = queue[qHead]
+		queue[qHead] = nil
+		qHead += 1
+		if inst and inst.Parent then
+			runHandlers(inst)
+		end
+		n += 1
+		if n % 32 == 0 and os.clock() > deadline then
+			return
+		end
+	end
+	qHead, qTail = 1, 0
+end
+
+local function pumpScan(deadline)
+	if not scan.active then
+		if needRescan and qHead > qTail then
+			needRescan = false
+			requestScan()
+		end
+		return
+	end
+	local stack, list = scan.stack, scan.list
+	local n = 0
+	while #stack > 0 do
+		local inst = stack[#stack]
+		stack[#stack] = nil
+		for i = 1, #list do
+			local def = list[i]
+			if def.active then
+				pcall(def.handler, inst, def.set)
+			end
+		end
+		local ok, kids = pcall(inst.GetChildren, inst)
+		if ok then
+			for i = 1, #kids do
+				stack[#stack + 1] = kids[i]
+			end
+		end
+		n += 1
+		if n % 24 == 0 and os.clock() > deadline then
+			return
+		end
+	end
+	scan.active = false
+end
+
+function setFeature(def, state)
+	if def.active == state or def.restoring then
+		return
+	end
+	def.active = state
+	if def.handler then
+		activeHandlers += state and 1 or -1
+	end
+	if state then
+		if def.on then
+			pcall(def.on)
+		end
+		if def.handler then
+			requestScan()
+		end
+	else
+		if def.off then
+			pcall(def.off)
+		end
+		if def.handler or def.usesStore then
+			local old = def.store
+			def.store = {}
+			def.restoring = true
+			restoreAsync(old, function()
+				def.restoring = false
+			end)
+		end
+	end
+	if def.visual then
+		def.visual(state)
+	end
+	saveSoon()
+end
+
+for _, root in ipairs(roots) do
+	table.insert(connections, root.DescendantAdded:Connect(function(inst)
+		if activeHandlers <= 0 then
+			return
+		end
+		if qTail - qHead >= QUEUE_MAX then
+			needRescan = true -- queue full: one background re-sweep will catch the rest
+			return
+		end
+		qTail += 1
+		queue[qTail] = inst
+	end))
+end
+
+local statFrames, statLast = 0, os.clock()
+local statText, fpsNow = "", 60
+
+table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+	frameDt = frameDt * 0.9 + dt * 0.1
+
+	statFrames += 1
+	local now = os.clock()
+	if now - statLast >= 0.5 then
+		fpsNow = math.floor(statFrames / (now - statLast) + 0.5)
+		if hint ~= "" then
+			statText = hint
+		elseif now < noteUntil then
+			statText = note
+		else
+			statText = ("%d FPS  |  %d MB  |  Lua %d MB"):format(fpsNow, math.floor(totalMb()), math.floor(luaMb()))
+		end
+		statFrames, statLast = 0, now
+	end
+
+	if activeHandlers <= 0 and not scan.active then
+		return
+	end
+	local deadline = os.clock() + budget()
+	pumpQueue(deadline)
+	pumpScan(deadline)
+	pumpCull(deadline)
+end))
+
+---------------------------------------------------------------- gui
+local guiParent = (gethui and gethui())
+	or (pcall(function() return game:GetService("CoreGui").Name end) and game:GetService("CoreGui"))
+	or player:WaitForChild("PlayerGui")
+
+local gui = new("ScreenGui", {
+	Name = "FPSOptimizer",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 999,
+}, guiParent)
+
+-- layout: 4 columns x 3 rows of toggles on the left, actions on the right
+local CELL_W, CELL_H, CELL_GAP = 128, 30, 6
+local COLS, ROWS = 4, 3
+local PAD, HDR, SIDE_W = 8, 32, 112
+local GRID_W = COLS * CELL_W + (COLS - 1) * CELL_GAP
+local GRID_H = ROWS * CELL_H + (ROWS - 1) * CELL_GAP
+local WIN_W = PAD + GRID_W + PAD + SIDE_W + PAD
+local WIN_H = PAD + HDR + PAD - 2 + GRID_H + PAD
+
+local main = new("Frame", {
+	Name = "Main",
+	Size = UDim2.fromOffset(WIN_W, WIN_H),
+	Position = UDim2.fromScale(saved.window[1], saved.window[2]),
+	BackgroundColor3 = C.bg,
+	BackgroundTransparency = 0.03,
+	BorderSizePixel = 0,
+	Visible = false,
+}, gui)
+round(main, 12)
+outline(main, C.stroke, 0.1)
+local winScale = new("UIScale", { Scale = 1 }, main)
+
+-- header: an inset rounded pill, so no square corner ever pokes out of the window edge
+local bar = new("Frame", {
+	Name = "Header",
+	Position = UDim2.fromOffset(PAD, PAD),
+	Size = UDim2.new(1, -PAD * 2, 0, HDR),
+	BackgroundColor3 = C.bar,
+	BorderSizePixel = 0,
+}, main)
+round(bar, 8)
+
+local dot = new("Frame", {
+	Position = UDim2.new(0, 12, 0.5, -4),
+	Size = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = C.accent,
+	BorderSizePixel = 0,
+}, bar)
+round(dot, UDim.new(1, 0))
+
+new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(28, 0),
+	Size = UDim2.fromOffset(110, HDR),
+	Font = Enum.Font.GothamBold,
+	Text = "FPS Optimizer",
+	TextColor3 = C.text,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, bar)
+
+local statLabel = new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(142, 0),
+	Size = UDim2.new(1, -142 - 66, 1, 0),
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextColor3 = C.dim,
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Right,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+}, bar)
+
+local function barButton(text, offset)
+	local b = new("TextButton", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(26, 26),
+		Position = UDim2.new(1, offset, 0.5, -13),
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextColor3 = C.dim,
+		TextSize = 15,
+		AutoButtonColor = false,
+	}, bar)
+	b.MouseEnter:Connect(function()
+		tween(b, 0.12, { TextColor3 = C.text })
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, 0.12, { TextColor3 = C.dim })
+	end)
+	return b
+end
+
+local closeBtn = barButton("x", -30)
+local hideBtn = barButton("-", -56)
+
+-- toggle chips
+local grid = new("Frame", {
+	Name = "Grid",
+	Position = UDim2.fromOffset(PAD, PAD + HDR + PAD - 2),
+	Size = UDim2.fromOffset(GRID_W, GRID_H),
+	BackgroundTransparency = 1,
+}, main)
+new("UIGridLayout", {
+	CellSize = UDim2.fromOffset(CELL_W, CELL_H),
+	CellPadding = UDim2.fromOffset(CELL_GAP, CELL_GAP),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+	FillDirectionMaxCells = COLS,
+}, grid)
+
+local function addChip(def, order)
+	local chip = new("TextButton", {
+		BackgroundColor3 = C.row,
+		BorderSizePixel = 0,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = order,
+	}, grid)
+	round(chip, 8)
+	local stroke = outline(chip, C.stroke, 0.45)
+
+	local pip = new("Frame", {
+		Size = UDim2.fromOffset(7, 7),
+		Position = UDim2.new(0, 11, 0.5, -3),
+		BackgroundColor3 = C.off,
+		BorderSizePixel = 0,
+	}, chip)
+	round(pip, UDim.new(1, 0))
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(26, 0),
+		Size = UDim2.new(1, -30, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = def.name,
+		TextColor3 = C.text,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, chip)
+
+	def.visual = function(state)
+		tween(chip, 0.15, { BackgroundColor3 = state and C.rowOn or C.row })
+		tween(pip, 0.15, { BackgroundColor3 = state and C.accent or C.off })
+		tween(stroke, 0.15, {
+			Color = state and C.accent or C.stroke,
+			Transparency = state and 0.2 or 0.45,
+		})
+	end
+
+	chip.MouseEnter:Connect(function()
+		hint = def.desc or ""
+		if not def.active then
+			tween(chip, 0.1, { BackgroundColor3 = C.rowHover })
+		end
+	end)
+	chip.MouseLeave:Connect(function()
+		hint = ""
+		if not def.active then
+			tween(chip, 0.1, { BackgroundColor3 = C.row })
+		end
+	end)
+	chip.MouseButton1Click:Connect(function()
+		setFeature(def, not def.active)
+	end)
+end
+
+-- fixed visual order (rows of four)
+local ORDER = {
+	shadows, effects, lights, materials,
+	textures, meshDetail, hidePlayers, cull,
+	lowest, fpsCap, pause3d, autoMem,
+}
+for i, def in ipairs(ORDER) do
+	addChip(def, i)
+end
+
+-- side panel
+local side = new("Frame", {
+	Name = "Side",
+	Position = UDim2.new(0, PAD + GRID_W + PAD, 0, PAD + HDR + PAD - 2),
+	Size = UDim2.fromOffset(SIDE_W, GRID_H),
+	BackgroundTransparency = 1,
+}, main)
+new("UIListLayout", {
+	Padding = UDim.new(0, CELL_GAP),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}, side)
+
+local function sideButton(text, color, order, textColor)
+	local b = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, CELL_H),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextColor3 = textColor or Color3.new(1, 1, 1),
+		TextSize = 11,
+		AutoButtonColor = false,
+		LayoutOrder = order,
+	}, side)
+	round(b, 8)
+	b.MouseEnter:Connect(function()
+		tween(b, 0.1, { BackgroundColor3 = color:Lerp(Color3.new(1, 1, 1), 0.12) })
+	end)
+	b.MouseLeave:Connect(function()
+		tween(b, 0.1, { BackgroundColor3 = color })
+	end)
+	return b
+end
+
+local optimizeBtn = sideButton("Optimize all", C.accent, 1)
+local cleanBtn = sideButton("Clean memory", C.off, 2)
+local capBtn = sideButton("", C.row, 3, C.text)
+outline(capBtn, C.stroke, 0.45)
+
+local function refreshCapLabel()
+	capBtn.Text = ("Cap: %d FPS"):format(saved.cap)
+end
+refreshCapLabel()
+
+capBtn.MouseButton1Click:Connect(function()
+	local idx = table.find(FPS_CAPS, saved.cap) or 0
+	saved.cap = FPS_CAPS[idx % #FPS_CAPS + 1]
+	refreshCapLabel()
+	if fpsCap.active then
+		applyCap()
+	end
+	saveSoon()
+end)
+
+local function allOptimized()
+	for _, def in ipairs(features) do
+		if def ~= autoMem and def ~= pause3d and not def.active then
+			return false
+		end
+	end
+	return true
+end
+
+local function refreshOptimizeLabel()
+	optimizeBtn.Text = allOptimized() and "Restore all" or "Optimize all"
+end
+
+optimizeBtn.MouseButton1Click:Connect(function()
+	local enable = not allOptimized()
+	for _, def in ipairs(features) do
+		if def ~= autoMem and def ~= pause3d then
+			setFeature(def, enable)
+		end
+	end
+	if enable then
+		-- features turned on manually are no longer "auto" ones
+		table.clear(autoEnabled)
+	end
+	refreshOptimizeLabel()
+end)
+
+for _, def in ipairs(features) do
+	local original = def.visual
+	def.visual = function(state)
+		if original then
+			original(state)
+		end
+		refreshOptimizeLabel()
+	end
+end
+
+local cleaning = false
+cleanBtn.MouseButton1Click:Connect(function()
+	if cleaning then
+		return
+	end
+	cleaning = true
+	cleanBtn.Text = "Cleaning..."
+	task.spawn(function()
+		local before = totalMb()
+		local ok = gentleGC(5)
+		if not ok then
+			-- stepping is blocked here: a single manual collect is fine because you asked for it
+			pcall(collectgarbage, "collect")
+		end
+		task.wait(1)
+		local freed = before - totalMb()
+		cleanBtn.Text = freed >= 5 and ("Freed %d MB"):format(freed) or "Cleaned"
+		task.wait(2)
+		cleanBtn.Text = "Clean memory"
+		cleaning = false
+	end)
+end)
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	if statLabel.Text ~= statText then
+		statLabel.Text = statText
+	end
+end))
+
+---------------------------------------------------------------- bubble
+local bubble = new("TextButton", {
+	Name = "Bubble",
+	Size = UDim2.fromOffset(46, 46),
+	Position = UDim2.fromScale(saved.bubble[1], saved.bubble[2]),
+	BackgroundColor3 = C.bg,
+	BackgroundTransparency = 0.05,
+	BorderSizePixel = 0,
+	Text = "",
+	AutoButtonColor = false,
+	ZIndex = 5,
+}, gui)
+round(bubble, UDim.new(1, 0))
+local bubbleStroke = outline(bubble, C.accent, 0.1, 2)
+
+local bubbleNum = new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(0, 8),
+	Size = UDim2.new(1, 0, 0, 18),
+	Font = Enum.Font.GothamBold,
+	Text = "--",
+	TextColor3 = C.good,
+	TextSize = 15,
+	ZIndex = 6,
+}, bubble)
+
+new("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(0, 25),
+	Size = UDim2.new(1, 0, 0, 12),
+	Font = Enum.Font.GothamBold,
+	Text = "FPS",
+	TextColor3 = C.dim,
+	TextSize = 9,
+	ZIndex = 6,
+}, bubble)
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	local text = tostring(fpsNow)
+	if bubbleNum.Text ~= text then
+		bubbleNum.Text = text
+		bubbleNum.TextColor3 = fpsNow >= 50 and C.good or (fpsNow >= 30 and C.warn or C.bad)
+	end
+end))
+
+---------------------------------------------------------------- placement, drag, open / close
+local function place(obj, x, y)
+	local screen = gui.AbsoluteSize
+	local size = obj.AbsoluteSize
+	x = math.clamp(x, 0, math.max(0, screen.X - size.X))
+	y = math.clamp(y, 0, math.max(0, screen.Y - size.Y))
+	obj.Position = UDim2.fromScale(x / math.max(1, screen.X), y / math.max(1, screen.Y))
+end
+
+local function makeDraggable(handle, target, savedKey, onTap)
+	local dragging, moved, startMouse, startPos = false, false, Vector2.zero, Vector2.zero
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			startMouse = Vector2.new(input.Position.X, input.Position.Y)
+			startPos = target.AbsolutePosition
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if moved then
+						local pos = target.Position
+						saved[savedKey] = { pos.X.Scale, pos.Y.Scale }
+						saveSoon()
+					elseif onTap then
+						onTap()
+					end
+				end
+			end)
+		end
+	end)
+	table.insert(connections, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - startMouse
+			if not moved and delta.Magnitude < 6 then
+				return
+			end
+			moved = true
+			place(target, startPos.X + delta.X, startPos.Y + delta.Y)
+		end
+	end))
+end
+
+local isOpen = false
+local fitScale = 1
+local openToken = 0
+
+local function refit()
+	local screen = gui.AbsoluteSize
+	fitScale = math.min(1, (screen.X - 16) / WIN_W, (screen.Y - 16) / WIN_H)
+	winScale.Scale = fitScale * (isOpen and 1 or 0.92)
+end
+
+local function setOpen(state)
+	isOpen = state
+	openToken += 1
+	local token = openToken
+	saved.open = state
+	saveSoon()
+	if state then
+		main.Visible = true
+		winScale.Scale = fitScale * 0.92
+		tween(winScale, 0.16, { Scale = fitScale })
+		task.defer(function()
+			place(main, main.AbsolutePosition.X, main.AbsolutePosition.Y)
+		end)
+	else
+		tween(winScale, 0.12, { Scale = fitScale * 0.92 })
+		task.delay(0.13, function()
+			if openToken == token then
+				main.Visible = false
+			end
+		end)
+	end
+	tween(bubbleStroke, 0.15, { Transparency = state and 0.55 or 0.1 })
+end
+
+makeDraggable(bar, main, "window")
+makeDraggable(bubble, bubble, "bubble", function()
+	setOpen(not isOpen)
+end)
+
+hideBtn.MouseButton1Click:Connect(function()
+	setOpen(false)
+end)
+
+table.insert(connections, gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	refit()
+	task.defer(function()
+		place(main, main.AbsolutePosition.X, main.AbsolutePosition.Y)
+		place(bubble, bubble.AbsolutePosition.X, bubble.AbsolutePosition.Y)
+	end)
+end))
+
+---------------------------------------------------------------- close / keys
+local function shutdown()
+	if closed then
+		return
+	end
+	if snapshotStates then
+		snapshotStates()
+	end
+	if canFile then
+		pcall(writefile, FILE, HttpService:JSONEncode(saved))
+	end
+	closed = true
+	for _, def in ipairs(features) do
+		if def.active then
+			setFeature(def, false)
+		end
+	end
+	pcall(function()
+		RunService:Set3dRenderingEnabled(true)
+	end)
+	for _, c in ipairs(connections) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	gui:Destroy()
+	if getgenv then
+		getgenv().__FPSOPT = nil
+	end
+end
+
+closeBtn.MouseButton1Click:Connect(shutdown)
+if getgenv then
+	getgenv().__FPSOPT = shutdown
+end
+
+table.insert(connections, UIS.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		setOpen(not isOpen)
+	elseif input.KeyCode == Enum.KeyCode.F6 and pause3d.active then
+		setFeature(pause3d, false)
+	end
+end))
+
+---------------------------------------------------------------- start
+refit()
+task.defer(function()
+	place(bubble, bubble.AbsolutePosition.X, bubble.AbsolutePosition.Y)
+	place(main, main.AbsolutePosition.X, main.AbsolutePosition.Y)
+end)
+refreshOptimizeLabel()
+
+-- restore what was on last time (Pause 3D never starts on by itself)
+for _, def in ipairs(features) do
+	if def ~= pause3d then
+		local want = saved.states[def.name]
+		if want == nil then
+			want = def == autoMem -- the memory guard is the one safe feature that starts on by itself
+		end
+		if want then
+			setFeature(def, true)
+		end
+	end
+end
+
+if saved.open then
+	setOpen(true)
+end
