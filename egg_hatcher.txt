@@ -1,0 +1,811 @@
+-- Egg Hatcher | executor script
+-- Hatches the nearest egg (optionally only eggs whose name matches a filter, default "Golden Grove").
+-- RightShift shows/hides the window. "x" stops everything and cleans up.
+--
+-- Counting note: the "hatched" numbers count hatches the server ACCEPTED (success replies),
+-- so they stay accurate even when the hatch animation is skipped.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local RS = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local TOUCH = UIS.TouchEnabled
+local genv = (type(getgenv) == "function" and getgenv()) or _G
+
+if type(genv.__EGGHATCHER) == "function" then
+	pcall(genv.__EGGHATCHER)
+	task.wait(0.2)
+end
+
+local alive = true
+local conns = {}
+local function track(c)
+	conns[#conns + 1] = c
+	return c
+end
+
+---------------------------------------------------------------- settings + saved stats
+local FILE = "EggHatcher_Stats.json"
+local cfg = { filter = "Golden Grove", range = 60, parallel = 2, skipAnim = true }
+local stats = { total = 0, perEgg = {} }
+local statsDirty = false
+
+local function loadSaved()
+	if type(isfile) ~= "function" or type(readfile) ~= "function" then
+		return
+	end
+	local ok, data = pcall(function()
+		if not isfile(FILE) then
+			return nil
+		end
+		return HttpService:JSONDecode(readfile(FILE))
+	end)
+	if ok and type(data) == "table" then
+		if type(data.stats) == "table" then
+			stats.total = tonumber(data.stats.total) or 0
+			if type(data.stats.perEgg) == "table" then
+				stats.perEgg = data.stats.perEgg
+			end
+		end
+		if type(data.cfg) == "table" then
+			if type(data.cfg.filter) == "string" then cfg.filter = data.cfg.filter end
+			if tonumber(data.cfg.range) then cfg.range = math.clamp(tonumber(data.cfg.range), 5, 500) end
+			if tonumber(data.cfg.parallel) then cfg.parallel = math.clamp(math.floor(tonumber(data.cfg.parallel)), 1, 4) end
+			if type(data.cfg.skipAnim) == "boolean" then cfg.skipAnim = data.cfg.skipAnim end
+		end
+	end
+end
+
+local function saveNow()
+	if type(writefile) ~= "function" then
+		return
+	end
+	pcall(function()
+		writefile(FILE, HttpService:JSONEncode({ stats = stats, cfg = cfg }))
+	end)
+	statsDirty = false
+end
+
+loadSaved()
+
+---------------------------------------------------------------- game access
+local canSetIdentity = type(setthreadidentity) == "function"
+local IDENTITY_EXEC = 7
+if type(getthreadidentity) == "function" then
+	local ok, id = pcall(getthreadidentity)
+	if ok and type(id) == "number" then
+		IDENTITY_EXEC = id
+	end
+end
+
+-- game modules expect a game-level thread identity, so every call goes through here
+local function gcall(fn, ...)
+	if type(fn) ~= "function" then
+		return false, "not a function"
+	end
+	if canSetIdentity then
+		pcall(setthreadidentity, 2)
+	end
+	local r = table.pack(pcall(fn, ...))
+	if canSetIdentity then
+		pcall(setthreadidentity, IDENTITY_EXEC)
+	end
+	return table.unpack(r, 1, r.n)
+end
+
+local function req(path)
+	local ok, mod = gcall(function()
+		local node = RS
+		for seg in string.gmatch(path, "[^%.]+") do
+			node = node:FindFirstChild(seg)
+			if not node then
+				error("missing " .. path)
+			end
+		end
+		return require(node)
+	end)
+	if ok then
+		return mod
+	end
+	return nil
+end
+
+local G = {}
+local modulesReady = false
+
+task.spawn(function()
+	local t0 = os.clock()
+	while alive and os.clock() - t0 < 30 do
+		local lib = RS:FindFirstChild("Library")
+		local client = lib and lib:FindFirstChild("Client")
+		if client and client:FindFirstChild("Network") then
+			break
+		end
+		task.wait(0.5)
+	end
+	G.Network = req("Library.Client.Network")
+	G.CustomEggs = req("Library.Client.CustomEggsCmds")
+	G.EggCmds = req("Library.Client.EggCmds")
+	G.Eggs = req("Library.Directory.Eggs")
+	G.CurrencyCmds = req("Library.Client.CurrencyCmds")
+	modulesReady = G.Network ~= nil
+end)
+
+local function netInvoke(name, ...)
+	if not (G.Network and type(G.Network.Invoke) == "function") then
+		return false, "Network module not found"
+	end
+	return gcall(G.Network.Invoke, name, ...)
+end
+
+local function hrp()
+	local c = LocalPlayer.Character
+	return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+---------------------------------------------------------------- egg picking
+local function allEggs()
+	local out = {}
+	if not (G.CustomEggs and type(G.CustomEggs.All) == "function") then
+		return out
+	end
+	local ok, all = gcall(G.CustomEggs.All)
+	if not ok or type(all) ~= "table" then
+		return out
+	end
+	for uid, e in pairs(all) do
+		if type(e) == "table" then
+			local pos = e._position
+			if typeof(pos) ~= "Vector3" and e._model and e._model.Parent then
+				pcall(function()
+					pos = e._model:GetPivot().Position
+				end)
+			end
+			if typeof(pos) == "Vector3" then
+				out[#out + 1] = {
+					uid = e._uid or uid,
+					id = tostring(e._id or "?"),
+					dir = e._dir or (G.Eggs and G.Eggs[e._id]) or nil,
+					pos = pos,
+					hatchable = e._hatchable,
+					maxCount = e._maxEggCount,
+				}
+			end
+		end
+	end
+	return out
+end
+
+local function matchesFilter(id)
+	local f = string.lower(cfg.filter or "")
+	if f == "" then
+		return true
+	end
+	return string.find(string.lower(id), f, 1, true) ~= nil
+end
+
+local function maxHatch(egg)
+	if egg.maxCount and type(egg.maxCount) == "number" and egg.maxCount >= 1 then
+		return math.floor(egg.maxCount)
+	end
+	if G.EggCmds and type(G.EggCmds.GetMaxHatch) == "function" then
+		local ok, n = gcall(G.EggCmds.GetMaxHatch, egg.dir)
+		if ok and type(n) == "number" and n >= 1 then
+			return math.floor(n)
+		end
+	end
+	return 1
+end
+
+local regularOffUntil = 0
+local target, targetDist, targetAt, targetNote = nil, nil, 0, ""
+
+-- nearest matching custom egg in range; falls back to a regular egg named by the filter (experimental)
+local function refreshTarget()
+	targetAt = os.clock()
+	local root = hrp()
+	if not root then
+		target, targetDist, targetNote = nil, nil, "no character"
+		return
+	end
+	local p = root.Position
+	local best, bestD
+	for _, e in ipairs(allEggs()) do
+		if matchesFilter(e.id) and e.hatchable ~= false then
+			local d = (e.pos - p).Magnitude
+			if d <= cfg.range and (not bestD or d < bestD) then
+				best, bestD = e, d
+			end
+		end
+	end
+	if best then
+		best.amount = maxHatch(best)
+		target, targetDist, targetNote = best, bestD, ""
+		return
+	end
+	if (cfg.filter or "") ~= "" and os.clock() >= regularOffUntil then
+		target = { regular = true, id = cfg.filter, amount = maxHatch({}) }
+		targetDist, targetNote = nil, "regular egg"
+		return
+	end
+	target, targetDist = nil, nil
+	targetNote = ("no egg matching '%s' within %d studs"):format(cfg.filter or "", cfg.range)
+end
+
+---------------------------------------------------------------- hatch engine
+local hatching = false
+local status, statusKind = "Idle", "idle"
+local inFlight = 0
+local backoffUntil = 0
+local failStreak, rateStreak = 0, 0
+local amountCap = {}
+local sessionHatched = 0
+local lastLaunchAt, lastSave = 0, 0
+local events = {} -- {t, n} of recent accepted hatches
+local hatchStartedAt = 0
+local lastRate = 0
+
+local function setStatus(text, kind)
+	status, statusKind = text, kind
+end
+
+local function addHatched(id, n)
+	sessionHatched += n
+	stats.total += n
+	stats.perEgg[id] = (tonumber(stats.perEgg[id]) or 0) + n
+	statsDirty = true
+	events[#events + 1] = { t = os.clock(), n = n }
+end
+
+local function requestHatch(egg, amount)
+	if egg.regular then
+		return netInvoke("Eggs_RequestPurchase", egg.id, amount)
+	end
+	return netInvoke("CustomEggs_Hatch", egg.uid, amount)
+end
+
+local function worker(egg, amount)
+	local ok, res, msg = requestHatch(egg, amount)
+	inFlight = math.max(0, inFlight - 1)
+	if not alive then
+		return
+	end
+	if ok and res == true then
+		failStreak, rateStreak = 0, 0
+		addHatched(egg.id, amount)
+		setStatus("Hatching", "ok")
+		return
+	end
+	local text = string.lower(tostring(msg or res or ""))
+	if string.find(text, "quickly", 1, true) or string.find(text, "too fast", 1, true) or string.find(text, "slow down", 1, true) then
+		rateStreak += 1
+		backoffUntil = os.clock() + math.min(0.12 * rateStreak, 1.5)
+		setStatus("Server rate limit, slowing down", "warn")
+	elseif string.find(text, "afford", 1, true) or string.find(text, "enough", 1, true) or string.find(text, "coin", 1, true) then
+		if amount > 1 then
+			amountCap[egg.id] = { n = math.max(1, math.floor(amount / 2)), at = os.clock() }
+			setStatus(("Not enough coins for x%d, trying less"):format(amount), "warn")
+		else
+			backoffUntil = os.clock() + 1
+			setStatus("Not enough coins", "bad")
+		end
+	else
+		failStreak += 1
+		backoffUntil = os.clock() + math.min(0.3 * failStreak, 3)
+		setStatus("Hatch failed: " .. tostring(msg or res), "bad")
+		if egg.regular and failStreak >= 4 then
+			regularOffUntil = os.clock() + 15
+			failStreak = 0
+		end
+	end
+end
+
+local function eggCost(egg)
+	local d = egg.dir
+	if type(d) == "table" and type(d.overrideCost) == "number" and d.currency ~= nil then
+		return d.overrideCost, d.currency
+	end
+	return nil
+end
+
+local function heartbeatHatch()
+	if not hatching then
+		return
+	end
+	-- a request that never answers must not freeze hatching forever
+	if inFlight > 0 and os.clock() - lastLaunchAt > 8 then
+		inFlight = 0
+	end
+	if inFlight >= cfg.parallel or os.clock() < backoffUntil then
+		return
+	end
+	if not modulesReady then
+		setStatus("Loading game modules...", "warn")
+		return
+	end
+	if os.clock() - targetAt > 0.3 or not target then
+		refreshTarget()
+	end
+	local egg = target
+	if not egg then
+		setStatus("Waiting: " .. targetNote, "warn")
+		return
+	end
+	local amount = egg.amount or 1
+	local cap = amountCap[egg.id]
+	if cap and os.clock() - cap.at < 10 then
+		amount = math.min(amount, cap.n)
+	end
+	local cost, cur = eggCost(egg)
+	if cost and cost > 0 and G.CurrencyCmds and type(G.CurrencyCmds.Get) == "function" then
+		local okC, have = gcall(G.CurrencyCmds.Get, cur)
+		if okC and type(have) == "number" then
+			local affordable = math.floor(have / cost)
+			if affordable < 1 then
+				backoffUntil = os.clock() + 0.5
+				setStatus("Not enough coins", "bad")
+				return
+			end
+			amount = math.max(1, math.min(amount, affordable))
+		end
+	end
+	inFlight += 1
+	lastLaunchAt = os.clock()
+	task.spawn(worker, egg, amount)
+end
+
+track(RunService.Heartbeat:Connect(function()
+	if alive then
+		heartbeatHatch()
+	end
+end))
+
+-- hatch animation off = hatches are not slowed down by the client playing them
+local animEnv, animOrig
+task.spawn(function()
+	if type(getsenv) ~= "function" then
+		return
+	end
+	pcall(function()
+		local ps = LocalPlayer:WaitForChild("PlayerScripts", 10)
+		local scripts = ps and ps:FindFirstChild("Scripts")
+		local gameFolder = scripts and scripts:FindFirstChild("Game")
+		local eggScript = gameFolder and gameFolder:FindFirstChild("Egg Opening Frontend")
+		if not eggScript then
+			return
+		end
+		local env = getsenv(eggScript)
+		if type(env) ~= "table" then
+			return
+		end
+		animEnv = env
+		animOrig = env.PlayEggAnimation
+		env.PlayEggAnimation = function(...)
+			if cfg.skipAnim and alive then
+				return
+			end
+			if type(animOrig) == "function" then
+				return animOrig(...)
+			end
+		end
+	end)
+end)
+
+---------------------------------------------------------------- stats math
+local function fmt(n)
+	n = math.floor((tonumber(n) or 0) + 0.5)
+	local s = tostring(n):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (s:gsub("^,", ""))
+end
+
+local WINDOW = 60
+local function computeRate()
+	local now = os.clock()
+	while events[1] and now - events[1].t > WINDOW do
+		table.remove(events, 1)
+	end
+	if not hatching then
+		return lastRate
+	end
+	local sum = 0
+	for _, e in ipairs(events) do
+		sum += e.n
+	end
+	local span = math.min(WINDOW, now - hatchStartedAt)
+	if span < 3 then
+		return lastRate
+	end
+	lastRate = sum / span -- hatches per second
+	return lastRate
+end
+
+local function countFor(filter)
+	local f = string.lower(filter or "")
+	local sum = 0
+	for id, n in pairs(stats.perEgg) do
+		if f == "" or string.find(string.lower(tostring(id)), f, 1, true) then
+			sum += tonumber(n) or 0
+		end
+	end
+	return sum
+end
+
+---------------------------------------------------------------- gui
+local C = {
+	bg = Color3.fromRGB(14, 15, 20),
+	bar = Color3.fromRGB(21, 22, 30),
+	row = Color3.fromRGB(24, 25, 33),
+	rowHover = Color3.fromRGB(32, 33, 43),
+	stroke = Color3.fromRGB(46, 48, 62),
+	text = Color3.fromRGB(228, 230, 240),
+	dim = Color3.fromRGB(128, 132, 150),
+	accent = Color3.fromRGB(104, 112, 255),
+	good = Color3.fromRGB(80, 200, 130),
+	warn = Color3.fromRGB(235, 190, 80),
+	bad = Color3.fromRGB(235, 90, 100),
+	off = Color3.fromRGB(50, 52, 66),
+}
+
+local function new(class, props, parent)
+	local obj = Instance.new(class)
+	for k, v in pairs(props) do
+		pcall(function()
+			obj[k] = v
+		end)
+	end
+	obj.Parent = parent
+	return obj
+end
+local function round(obj, r)
+	return new("UICorner", { CornerRadius = typeof(r) == "UDim" and r or UDim.new(0, r) }, obj)
+end
+local function outline(obj, color, transparency)
+	return new("UIStroke", {
+		Color = color, Thickness = 1, Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		LineJoinMode = Enum.LineJoinMode.Round,
+	}, obj)
+end
+local function tween(obj, t, props)
+	TweenService:Create(obj, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local guiParent = (type(gethui) == "function" and gethui())
+	or (pcall(function() return game:GetService("CoreGui").Name end) and game:GetService("CoreGui"))
+	or LocalPlayer:WaitForChild("PlayerGui")
+
+local gui = new("ScreenGui", {
+	Name = "EggHatcher", ResetOnSpawn = false, IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999,
+}, guiParent)
+
+local WIDTH = TOUCH and 270 or 290
+local PAD, HDR, GAP = 8, 32, 5
+
+local main = new("Frame", {
+	Name = "Main", Size = UDim2.fromOffset(WIDTH, 380), Position = UDim2.new(0, 24, 0.5, -190),
+	BackgroundColor3 = C.bg, BorderSizePixel = 0, ClipsDescendants = true,
+}, gui)
+round(main, 12)
+outline(main, C.stroke, 0.15)
+
+local bar = new("Frame", {
+	Position = UDim2.fromOffset(PAD, PAD), Size = UDim2.new(1, -PAD * 2, 0, HDR),
+	BackgroundColor3 = C.bar, BorderSizePixel = 0,
+}, main)
+round(bar, 8)
+
+local dot = new("Frame", {
+	Position = UDim2.new(0, 12, 0.5, -4), Size = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = C.off, BorderSizePixel = 0,
+}, bar)
+round(dot, UDim.new(1, 0))
+
+new("TextLabel", {
+	BackgroundTransparency = 1, Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -90, 1, 0),
+	Font = Enum.Font.GothamBold, Text = "Egg Hatcher", TextColor3 = C.text, TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, bar)
+
+local function barButton(text, offset)
+	local b = new("TextButton", {
+		BackgroundTransparency = 1, Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, offset, 0.5, -13),
+		Font = Enum.Font.GothamBold, Text = text, TextColor3 = C.dim, TextSize = 15, AutoButtonColor = false,
+	}, bar)
+	b.MouseEnter:Connect(function() tween(b, 0.12, { TextColor3 = C.text }) end)
+	b.MouseLeave:Connect(function() tween(b, 0.12, { TextColor3 = C.dim }) end)
+	return b
+end
+local closeBtn = barButton("x", -30)
+local miniBtn = barButton("-", -56)
+
+local body = new("Frame", {
+	Position = UDim2.fromOffset(0, PAD + HDR + GAP), Size = UDim2.new(1, 0, 0, 300), BackgroundTransparency = 1,
+}, main)
+new("UIPadding", { PaddingLeft = UDim.new(0, PAD), PaddingRight = UDim.new(0, PAD) }, body)
+local layout = new("UIListLayout", { Padding = UDim.new(0, GAP), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local fullH, minimized = 380, false
+local function relayout()
+	local contentY = layout.AbsoluteContentSize.Y
+	body.Size = UDim2.new(1, 0, 0, contentY)
+	fullH = PAD + HDR + GAP + contentY + PAD
+	if not minimized then
+		main.Size = UDim2.fromOffset(WIDTH, fullH)
+	end
+end
+layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(relayout)
+
+local order = 0
+local function nextOrder()
+	order += 1
+	return order
+end
+
+local function addToggle(label, initial, onChange)
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.row, BorderSizePixel = 0,
+		Text = "", AutoButtonColor = false, LayoutOrder = nextOrder(),
+	}, body)
+	round(row, 8)
+	new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(11, 0), Size = UDim2.new(1, -62, 1, 0),
+		Font = Enum.Font.GothamMedium, Text = label, TextColor3 = C.text, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local track = new("Frame", {
+		Size = UDim2.fromOffset(34, 18), Position = UDim2.new(1, -44, 0.5, -9),
+		BackgroundColor3 = initial and C.accent or C.off, BorderSizePixel = 0,
+	}, row)
+	round(track, UDim.new(1, 0))
+	local knob = new("Frame", {
+		Size = UDim2.fromOffset(14, 14),
+		Position = initial and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2),
+		BackgroundColor3 = C.text, BorderSizePixel = 0,
+	}, track)
+	round(knob, UDim.new(1, 0))
+	local state = initial
+	local function paint()
+		tween(track, 0.15, { BackgroundColor3 = state and C.accent or C.off })
+		tween(knob, 0.15, { Position = state and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2) })
+	end
+	row.MouseEnter:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.rowHover }) end)
+	row.MouseLeave:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.row }) end)
+	row.MouseButton1Click:Connect(function()
+		state = not state
+		paint()
+		onChange(state)
+	end)
+	return function(v)
+		state = v
+		paint()
+	end
+end
+
+local function textBox(parent, size, position, text, placeholder)
+	local box = new("TextBox", {
+		Size = size, Position = position, BackgroundColor3 = C.row, BorderSizePixel = 0,
+		Font = Enum.Font.GothamMedium, Text = text, PlaceholderText = placeholder,
+		PlaceholderColor3 = C.dim, TextColor3 = C.text, TextSize = 12, ClearTextOnFocus = false,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, parent)
+	round(box, 8)
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
+	outline(box, C.stroke, 0.5)
+	return box
+end
+
+-- toggles
+addToggle("Auto hatch", false, function(on)
+	hatching = on
+	if on then
+		hatchStartedAt = os.clock()
+		table.clear(events)
+		setStatus("Starting...", "ok")
+	else
+		setStatus("Idle", "idle")
+	end
+end)
+addToggle("Skip hatch animation", cfg.skipAnim, function(on)
+	cfg.skipAnim = on
+	statsDirty = true
+end)
+
+-- egg filter
+local filterBox = textBox(body, UDim2.new(1, 0, 0, 32), UDim2.new(), cfg.filter, "Egg name filter (empty = nearest egg)")
+filterBox.LayoutOrder = nextOrder()
+filterBox.FocusLost:Connect(function()
+	cfg.filter = filterBox.Text
+	target, targetAt = nil, 0
+	statsDirty = true
+end)
+
+-- range + speed
+local rowRS = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, body)
+local rangeBox = textBox(rowRS, UDim2.new(0.42, -3, 1, 0), UDim2.new(), tostring(cfg.range), "Range")
+local SPEED_LABEL = { "Speed 1x (safe)", "Speed 2x", "Speed 3x", "Speed 4x (max)" }
+local speedBtn = new("TextButton", {
+	Size = UDim2.new(0.58, -3, 1, 0), Position = UDim2.new(0.42, 3, 0, 0), BackgroundColor3 = C.row,
+	BorderSizePixel = 0, Font = Enum.Font.GothamMedium, Text = SPEED_LABEL[cfg.parallel], TextColor3 = C.text,
+	TextSize = 12, AutoButtonColor = false,
+}, rowRS)
+round(speedBtn, 8)
+outline(speedBtn, C.stroke, 0.5)
+rangeBox.FocusLost:Connect(function()
+	local v = tonumber(rangeBox.Text)
+	cfg.range = v and math.clamp(v, 5, 500) or cfg.range
+	rangeBox.Text = tostring(cfg.range)
+	target, targetAt = nil, 0
+	statsDirty = true
+end)
+speedBtn.MouseButton1Click:Connect(function()
+	cfg.parallel = cfg.parallel % 4 + 1
+	speedBtn.Text = SPEED_LABEL[cfg.parallel]
+	statsDirty = true
+end)
+
+-- stats card
+local card = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 10), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.row,
+	BorderSizePixel = 0, LayoutOrder = nextOrder(),
+}, body)
+round(card, 8)
+new("UIPadding", {
+	PaddingLeft = UDim.new(0, 11), PaddingRight = UDim.new(0, 11),
+	PaddingTop = UDim.new(0, 9), PaddingBottom = UDim.new(0, 9),
+}, card)
+new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, card)
+
+local lineOrder = 0
+local function statLine(label)
+	lineOrder += 1
+	local row = new("Frame", { Size = UDim2.new(1, 0, 0, 17), BackgroundTransparency = 1, LayoutOrder = lineOrder }, card)
+	local name = new("TextLabel", {
+		BackgroundTransparency = 1, Size = UDim2.new(0.4, 0, 1, 0), Font = Enum.Font.Gotham, Text = label,
+		TextColor3 = C.dim, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	local value = new("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromScale(0.4, 0), Size = UDim2.new(0.6, 0, 1, 0),
+		Font = Enum.Font.GothamBold, Text = "-", TextColor3 = C.text, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, row)
+	return value, name
+end
+
+local vStatus = statLine("Status")
+local vTarget = statLine("Egg")
+local vSession = statLine("This session")
+local vTotal = statLine("All time")
+local vGolden, lGolden = statLine("Golden Grove")
+local vRate = statLine("Speed")
+
+-- projection banner
+local banner = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = nextOrder(),
+}, body)
+round(banner, 8)
+outline(banner, C.accent, 0.55)
+local vProj = new("TextLabel", {
+	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 4),
+	Font = Enum.Font.GothamBold, Text = "-", TextColor3 = C.accent, TextSize = 16,
+}, banner)
+new("TextLabel", {
+	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 26),
+	Font = Enum.Font.Gotham, Text = "hatches in the next hour (at your last 60s speed)", TextColor3 = C.dim, TextSize = 10,
+}, banner)
+
+local KIND_COLOR = { ok = C.good, warn = C.warn, bad = C.bad, idle = C.dim }
+
+local uiAcc = 0
+track(RunService.Heartbeat:Connect(function(dt)
+	uiAcc += dt
+	if uiAcc < 0.25 then
+		return
+	end
+	uiAcc = 0
+
+	vStatus.Text = status
+	vStatus.TextColor3 = KIND_COLOR[statusKind] or C.text
+	dot.BackgroundColor3 = hatching and C.good or C.off
+
+	if target then
+		local name = target.id
+		if targetDist then
+			vTarget.Text = ("%s (%d studs) x%d"):format(name, math.floor(targetDist), target.amount or 1)
+		else
+			vTarget.Text = ("%s (regular) x%d"):format(name, target.amount or 1)
+		end
+	else
+		vTarget.Text = "none in range"
+	end
+
+	vSession.Text = fmt(sessionHatched)
+	vTotal.Text = fmt(stats.total)
+	local label = (cfg.filter ~= "" and cfg.filter or "All eggs")
+	vGolden.Text = fmt(countFor(cfg.filter))
+	lGolden.Text = label
+
+	local rate = computeRate()
+	if rate > 0 then
+		vRate.Text = ("%s / min"):format(fmt(rate * 60))
+		vProj.Text = "~" .. fmt(rate * 3600)
+	else
+		vRate.Text = hatching and "measuring..." or "-"
+		vProj.Text = hatching and "measuring..." or "-"
+	end
+
+	if statsDirty and os.clock() - lastSave > 15 then
+		lastSave = os.clock()
+		saveNow()
+	end
+end))
+
+-- drag (direct, clamped to the screen)
+local dragging, dragStart, startPos
+bar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging, dragStart, startPos = true, input.Position, main.AbsolutePosition
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+track(UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		local screen, size = gui.AbsoluteSize, main.AbsoluteSize
+		main.Position = UDim2.fromOffset(
+			math.clamp(startPos.X + delta.X, 0, math.max(0, screen.X - size.X)),
+			math.clamp(startPos.Y + delta.Y, 0, math.max(0, screen.Y - size.Y))
+		)
+	end
+end))
+
+miniBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	miniBtn.Text = minimized and "+" or "-"
+	tween(main, 0.2, { Size = UDim2.fromOffset(WIDTH, minimized and (PAD * 2 + HDR) or fullH) })
+end)
+
+track(UIS.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+		main.Visible = not main.Visible
+	end
+end))
+
+---------------------------------------------------------------- unload
+local function shutdown()
+	if not alive then
+		return
+	end
+	alive = false
+	hatching = false
+	for _, c in ipairs(conns) do
+		pcall(function() c:Disconnect() end)
+	end
+	pcall(function()
+		if animEnv and animOrig ~= nil then
+			animEnv.PlayEggAnimation = animOrig
+		end
+	end)
+	saveNow()
+	gui:Destroy()
+	genv.__EGGHATCHER = nil
+end
+closeBtn.MouseButton1Click:Connect(shutdown)
+genv.__EGGHATCHER = shutdown
+
+task.spawn(function()
+	task.wait()
+	relayout()
+	main.Position = UDim2.new(0, 24, 0.5, -fullH / 2)
+	if not modulesReady then
+		setStatus("Loading game modules...", "warn")
+	end
+end)
