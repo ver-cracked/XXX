@@ -1,9 +1,11 @@
--- Egg Hatcher | executor script
+-- Egg Hatcher v2 | executor script
 -- Hatches the nearest egg (optionally only eggs whose name matches a filter, default "Golden Grove").
 -- RightShift shows/hides the window. "x" stops everything and cleans up.
 --
--- Counting note: the "hatched" numbers count hatches the server ACCEPTED (success replies),
--- so they stay accurate even when the hatch animation is skipped.
+-- Speed engine: it never pauses. It keeps many requests in flight and spaces them with a pace
+-- that tunes itself to the server's limit: a rejected request widens the spacing a little, a run of
+-- accepted ones tightens it again, so it keeps probing for the fastest pace the server accepts.
+-- Each request always asks for the biggest hatch amount you can afford.
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -30,7 +32,7 @@ end
 
 ---------------------------------------------------------------- settings + saved stats
 local FILE = "EggHatcher_Stats.json"
-local cfg = { filter = "Golden Grove", range = 60, parallel = 2, skipAnim = true }
+local cfg = { filter = "Golden Grove", range = 60, skipAnim = true }
 local stats = { total = 0, perEgg = {} }
 local statsDirty = false
 
@@ -54,7 +56,6 @@ local function loadSaved()
 		if type(data.cfg) == "table" then
 			if type(data.cfg.filter) == "string" then cfg.filter = data.cfg.filter end
 			if tonumber(data.cfg.range) then cfg.range = math.clamp(tonumber(data.cfg.range), 5, 500) end
-			if tonumber(data.cfg.parallel) then cfg.parallel = math.clamp(math.floor(tonumber(data.cfg.parallel)), 1, 4) end
 			if type(data.cfg.skipAnim) == "boolean" then cfg.skipAnim = data.cfg.skipAnim end
 		end
 	end
@@ -202,14 +203,14 @@ local function maxHatch(egg)
 end
 
 local regularOffUntil = 0
-local target, targetDist, targetAt, targetNote = nil, nil, 0, ""
+local target, targetAt, targetNote = nil, 0, ""
 
 -- nearest matching custom egg in range; falls back to a regular egg named by the filter (experimental)
 local function refreshTarget()
 	targetAt = os.clock()
 	local root = hrp()
 	if not root then
-		target, targetDist, targetNote = nil, nil, "no character"
+		target, targetNote = nil, "no character"
 		return
 	end
 	local p = root.Position
@@ -224,30 +225,35 @@ local function refreshTarget()
 	end
 	if best then
 		best.amount = maxHatch(best)
-		target, targetDist, targetNote = best, bestD, ""
+		target, targetNote = best, ""
 		return
 	end
 	if (cfg.filter or "") ~= "" and os.clock() >= regularOffUntil then
 		target = { regular = true, id = cfg.filter, amount = maxHatch({}) }
-		targetDist, targetNote = nil, "regular egg"
+		targetNote = "regular egg"
 		return
 	end
-	target, targetDist = nil, nil
+	target = nil
 	targetNote = ("no egg matching '%s' within %d studs"):format(cfg.filter or "", cfg.range)
 end
 
 ---------------------------------------------------------------- hatch engine
+local MAX_IN_FLIGHT = 12
+local MAX_LAUNCH_PER_FRAME = 4
+
 local hatching = false
 local status, statusKind = "Idle", "idle"
 local inFlight = 0
-local backoffUntil = 0
-local failStreak, rateStreak = 0, 0
+local blockedUntil = 0 -- only for real problems (no coins / errors), never for the rate limit
+local failStreak = 0
 local amountCap = {}
-local sessionHatched = 0
-local lastLaunchAt, lastSave = 0, 0
-local events = {} -- {t, n} of recent accepted hatches
-local hatchStartedAt = 0
-local lastRate = 0
+local sessionHatched, acceptedReqs = 0, 0
+local lastLaunchAt, lastSave, lastSuccessAt = 0, 0, 0
+
+-- self-tuning pace: seconds between request launches
+local interval = 0.02
+local nextLaunchAt = 0
+local successStreak, lastAdjustAt = 0, 0
 
 local function setStatus(text, kind)
 	status, statusKind = text, kind
@@ -258,7 +264,40 @@ local function addHatched(id, n)
 	stats.total += n
 	stats.perEgg[id] = (tonumber(stats.perEgg[id]) or 0) + n
 	statsDirty = true
-	events[#events + 1] = { t = os.clock(), n = n }
+end
+
+local RATE_WORDS = { "quickly", "too fast", "slow down", "cooldown", "rate limit", "too many", "spam" }
+local function isRateLimit(text)
+	for _, w in ipairs(RATE_WORDS) do
+		if string.find(text, w, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+-- the server turned a request down for being too early: widen the spacing a little (once per burst)
+local function onRateLimited()
+	successStreak = 0
+	local now = os.clock()
+	if now - lastAdjustAt < 0.15 then
+		return
+	end
+	lastAdjustAt = now
+	interval = math.min(2, math.max(0.02, interval * 1.3 + 0.004))
+	nextLaunchAt = math.max(nextLaunchAt, now + interval)
+end
+
+-- a run of accepted requests: probe for a slightly faster pace
+local function onAccepted()
+	successStreak += 1
+	if successStreak >= 12 then
+		successStreak = 0
+		interval = interval * 0.94
+		if interval < 0.006 then
+			interval = 0
+		end
+	end
 end
 
 local function requestHatch(egg, amount)
@@ -275,27 +314,28 @@ local function worker(egg, amount)
 		return
 	end
 	if ok and res == true then
-		failStreak, rateStreak = 0, 0
+		failStreak = 0
+		acceptedReqs += 1
+		lastSuccessAt = os.clock()
 		addHatched(egg.id, amount)
 		setStatus("Hatching", "ok")
+		onAccepted()
 		return
 	end
 	local text = string.lower(tostring(msg or res or ""))
-	if string.find(text, "quickly", 1, true) or string.find(text, "too fast", 1, true) or string.find(text, "slow down", 1, true) then
-		rateStreak += 1
-		backoffUntil = os.clock() + math.min(0.12 * rateStreak, 1.5)
-		setStatus("Server rate limit, slowing down", "warn")
+	if isRateLimit(text) then
+		onRateLimited()
 	elseif string.find(text, "afford", 1, true) or string.find(text, "enough", 1, true) or string.find(text, "coin", 1, true) then
 		if amount > 1 then
 			amountCap[egg.id] = { n = math.max(1, math.floor(amount / 2)), at = os.clock() }
-			setStatus(("Not enough coins for x%d, trying less"):format(amount), "warn")
+			setStatus(("Not enough coins for x%d, using less"):format(amount), "warn")
 		else
-			backoffUntil = os.clock() + 1
+			blockedUntil = os.clock() + 0.4
 			setStatus("Not enough coins", "bad")
 		end
 	else
 		failStreak += 1
-		backoffUntil = os.clock() + math.min(0.3 * failStreak, 3)
+		blockedUntil = os.clock() + 0.25
 		setStatus("Hatch failed: " .. tostring(msg or res), "bad")
 		if egg.regular and failStreak >= 4 then
 			regularOffUntil = os.clock() + 15
@@ -312,22 +352,33 @@ local function eggCost(egg)
 	return nil
 end
 
+local balanceAt, balanceVal, balanceCur = 0, nil, nil
+local function coins(cur)
+	if balanceCur ~= cur or os.clock() - balanceAt > 0.15 then
+		balanceAt, balanceCur = os.clock(), cur
+		local ok, have = gcall(G.CurrencyCmds.Get, cur)
+		balanceVal = (ok and type(have) == "number") and have or nil
+	end
+	return balanceVal
+end
+
 local function heartbeatHatch()
 	if not hatching then
 		return
 	end
+	local now = os.clock()
 	-- a request that never answers must not freeze hatching forever
-	if inFlight > 0 and os.clock() - lastLaunchAt > 8 then
+	if inFlight > 0 and now - lastLaunchAt > 8 then
 		inFlight = 0
-	end
-	if inFlight >= cfg.parallel or os.clock() < backoffUntil then
-		return
 	end
 	if not modulesReady then
 		setStatus("Loading game modules...", "warn")
 		return
 	end
-	if os.clock() - targetAt > 0.3 or not target then
+	if now < blockedUntil then
+		return
+	end
+	if now - targetAt > 0.3 or not target then
 		refreshTarget()
 	end
 	local egg = target
@@ -337,25 +388,33 @@ local function heartbeatHatch()
 	end
 	local amount = egg.amount or 1
 	local cap = amountCap[egg.id]
-	if cap and os.clock() - cap.at < 10 then
+	if cap and now - cap.at < 10 then
 		amount = math.min(amount, cap.n)
 	end
 	local cost, cur = eggCost(egg)
 	if cost and cost > 0 and G.CurrencyCmds and type(G.CurrencyCmds.Get) == "function" then
-		local okC, have = gcall(G.CurrencyCmds.Get, cur)
-		if okC and type(have) == "number" then
+		local have = coins(cur)
+		if have then
 			local affordable = math.floor(have / cost)
 			if affordable < 1 then
-				backoffUntil = os.clock() + 0.5
+				blockedUntil = now + 0.3
 				setStatus("Not enough coins", "bad")
 				return
 			end
 			amount = math.max(1, math.min(amount, affordable))
 		end
 	end
-	inFlight += 1
-	lastLaunchAt = os.clock()
-	task.spawn(worker, egg, amount)
+	if nextLaunchAt < now - 0.05 then
+		nextLaunchAt = now - 0.05 -- never a big catch-up burst
+	end
+	local launched = 0
+	while launched < MAX_LAUNCH_PER_FRAME and inFlight < MAX_IN_FLIGHT and nextLaunchAt <= now do
+		inFlight += 1
+		lastLaunchAt = now
+		task.spawn(worker, egg, amount)
+		nextLaunchAt += interval
+		launched += 1
+	end
 end
 
 track(RunService.Heartbeat:Connect(function()
@@ -395,32 +454,29 @@ task.spawn(function()
 	end)
 end)
 
----------------------------------------------------------------- stats math
+---------------------------------------------------------------- number display helpers
 local function fmt(n)
 	n = math.floor((tonumber(n) or 0) + 0.5)
 	local s = tostring(n):reverse():gsub("(%d%d%d)", "%1,"):reverse()
 	return (s:gsub("^,", ""))
 end
 
-local WINDOW = 60
-local function computeRate()
-	local now = os.clock()
-	while events[1] and now - events[1].t > WINDOW do
-		table.remove(events, 1)
+-- 3 significant digits, so the big projection stays calm instead of flickering digits
+local function sig3(n)
+	if n < 1000 then
+		return math.floor(n + 0.5)
 	end
-	if not hatching then
-		return lastRate
+	local mag = 10 ^ (math.floor(math.log10(n)) - 2)
+	return math.floor(n / mag + 0.5) * mag
+end
+
+-- glides a shown number toward its goal; snaps when it is close
+local function approach(cur, goal, dt, speed)
+	local diff = goal - cur
+	if math.abs(diff) < 0.5 then
+		return goal
 	end
-	local sum = 0
-	for _, e in ipairs(events) do
-		sum += e.n
-	end
-	local span = math.min(WINDOW, now - hatchStartedAt)
-	if span < 3 then
-		return lastRate
-	end
-	lastRate = sum / span -- hatches per second
-	return lastRate
+	return cur + diff * math.min(1, dt * speed)
 end
 
 local function countFor(filter)
@@ -569,21 +625,14 @@ local function addToggle(label, initial, onChange)
 	}, track)
 	round(knob, UDim.new(1, 0))
 	local state = initial
-	local function paint()
-		tween(track, 0.15, { BackgroundColor3 = state and C.accent or C.off })
-		tween(knob, 0.15, { Position = state and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2) })
-	end
 	row.MouseEnter:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.rowHover }) end)
 	row.MouseLeave:Connect(function() tween(row, 0.1, { BackgroundColor3 = C.row }) end)
 	row.MouseButton1Click:Connect(function()
 		state = not state
-		paint()
+		tween(track, 0.15, { BackgroundColor3 = state and C.accent or C.off })
+		tween(knob, 0.15, { Position = state and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2) })
 		onChange(state)
 	end)
-	return function(v)
-		state = v
-		paint()
-	end
 end
 
 local function textBox(parent, size, position, text, placeholder)
@@ -599,12 +648,17 @@ local function textBox(parent, size, position, text, placeholder)
 	return box
 end
 
+-- smoothed numbers shown in the window
+local shown = { session = 0, total = stats.total, count = countFor(cfg.filter), hour = 0, pace = 0 }
+local rateEMA, reqEMA, warmSamples = 0, 0, 0
+
 -- toggles
 addToggle("Auto hatch", false, function(on)
 	hatching = on
 	if on then
-		hatchStartedAt = os.clock()
-		table.clear(events)
+		warmSamples = 0
+		interval = math.min(interval, 0.05)
+		nextLaunchAt = 0
 		setStatus("Starting...", "ok")
 	else
 		setStatus("Idle", "idle")
@@ -624,27 +678,20 @@ filterBox.FocusLost:Connect(function()
 	statsDirty = true
 end)
 
--- range + speed
-local rowRS = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, body)
-local rangeBox = textBox(rowRS, UDim2.new(0.42, -3, 1, 0), UDim2.new(), tostring(cfg.range), "Range")
-local SPEED_LABEL = { "Speed 1x (safe)", "Speed 2x", "Speed 3x", "Speed 4x (max)" }
-local speedBtn = new("TextButton", {
+-- range + live pace
+local rowRP = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, body)
+local rangeBox = textBox(rowRP, UDim2.new(0.42, -3, 1, 0), UDim2.new(), tostring(cfg.range), "Range")
+local paceLabel = new("TextLabel", {
 	Size = UDim2.new(0.58, -3, 1, 0), Position = UDim2.new(0.42, 3, 0, 0), BackgroundColor3 = C.row,
-	BorderSizePixel = 0, Font = Enum.Font.GothamMedium, Text = SPEED_LABEL[cfg.parallel], TextColor3 = C.text,
-	TextSize = 12, AutoButtonColor = false,
-}, rowRS)
-round(speedBtn, 8)
-outline(speedBtn, C.stroke, 0.5)
+	BorderSizePixel = 0, Font = Enum.Font.GothamMedium, Text = "Pace: -", TextColor3 = C.dim, TextSize = 12,
+}, rowRP)
+round(paceLabel, 8)
+outline(paceLabel, C.stroke, 0.5)
 rangeBox.FocusLost:Connect(function()
 	local v = tonumber(rangeBox.Text)
 	cfg.range = v and math.clamp(v, 5, 500) or cfg.range
 	rangeBox.Text = tostring(cfg.range)
 	target, targetAt = nil, 0
-	statsDirty = true
-end)
-speedBtn.MouseButton1Click:Connect(function()
-	cfg.parallel = cfg.parallel % 4 + 1
-	speedBtn.Text = SPEED_LABEL[cfg.parallel]
 	statsDirty = true
 end)
 
@@ -665,11 +712,11 @@ local function statLine(label)
 	lineOrder += 1
 	local row = new("Frame", { Size = UDim2.new(1, 0, 0, 17), BackgroundTransparency = 1, LayoutOrder = lineOrder }, card)
 	local name = new("TextLabel", {
-		BackgroundTransparency = 1, Size = UDim2.new(0.4, 0, 1, 0), Font = Enum.Font.Gotham, Text = label,
+		BackgroundTransparency = 1, Size = UDim2.new(0.34, 0, 1, 0), Font = Enum.Font.Gotham, Text = label,
 		TextColor3 = C.dim, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
 	}, row)
 	local value = new("TextLabel", {
-		BackgroundTransparency = 1, Position = UDim2.fromScale(0.4, 0), Size = UDim2.new(0.6, 0, 1, 0),
+		BackgroundTransparency = 1, Position = UDim2.fromScale(0.34, 0), Size = UDim2.new(0.66, 0, 1, 0),
 		Font = Enum.Font.GothamBold, Text = "-", TextColor3 = C.text, TextSize = 12,
 		TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
 	}, row)
@@ -677,66 +724,110 @@ local function statLine(label)
 end
 
 local vStatus = statLine("Status")
-local vTarget = statLine("Egg")
+local vEgg = statLine("Egg")
+local vDist = statLine("Distance")
 local vSession = statLine("This session")
 local vTotal = statLine("All time")
-local vGolden, lGolden = statLine("Golden Grove")
+local vCount, lCount = statLine("Golden Grove")
 local vRate = statLine("Speed")
 
 -- projection banner
 local banner = new("Frame", {
-	Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = nextOrder(),
+	Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.row, BorderSizePixel = 0, LayoutOrder = nextOrder(),
 }, body)
 round(banner, 8)
 outline(banner, C.accent, 0.55)
 local vProj = new("TextLabel", {
-	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 24), Position = UDim2.fromOffset(0, 4),
-	Font = Enum.Font.GothamBold, Text = "-", TextColor3 = C.accent, TextSize = 16,
+	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 26), Position = UDim2.fromOffset(0, 4),
+	Font = Enum.Font.GothamBold, Text = "-", TextColor3 = C.accent, TextSize = 18,
 }, banner)
 new("TextLabel", {
-	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 26),
-	Font = Enum.Font.Gotham, Text = "hatches in the next hour (at your last 60s speed)", TextColor3 = C.dim, TextSize = 10,
+	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14), Position = UDim2.fromOffset(0, 28),
+	Font = Enum.Font.Gotham, Text = "hatches in the next hour", TextColor3 = C.dim, TextSize = 10,
 }, banner)
 
 local KIND_COLOR = { ok = C.good, warn = C.warn, bad = C.bad, idle = C.dim }
 
-local uiAcc = 0
+local function setText(label, text)
+	if label.Text ~= text then
+		label.Text = text
+	end
+end
+
+local sampleAcc, lastSessionCount, lastAccepted = 0, 0, 0
+
 track(RunService.Heartbeat:Connect(function(dt)
-	uiAcc += dt
-	if uiAcc < 0.25 then
+	if not alive then
 		return
 	end
-	uiAcc = 0
 
-	vStatus.Text = status
-	vStatus.TextColor3 = KIND_COLOR[statusKind] or C.text
+	-- once a second: smooth speed estimates (running average first, then a gentle moving average)
+	sampleAcc += dt
+	if sampleAcc >= 1 then
+		local instRate = (sessionHatched - lastSessionCount) / sampleAcc
+		local instReq = (acceptedReqs - lastAccepted) / sampleAcc
+		lastSessionCount, lastAccepted, sampleAcc = sessionHatched, acceptedReqs, 0
+		if hatching then
+			warmSamples += 1
+			local a = math.max(0.12, 1 / warmSamples)
+			rateEMA += (instRate - rateEMA) * a
+			reqEMA += (instReq - reqEMA) * a
+		end
+	end
+
+	-- status: only claim "waiting" if the server has not accepted anything for a few seconds
+	local kind = statusKind
+	local text = status
+	if not hatching then
+		kind, text = "idle", "Idle"
+	elseif kind == "ok" and os.clock() - lastSuccessAt > 3 and warmSamples > 0 then
+		kind, text = "warn", "Waiting for the server..."
+	end
+	setText(vStatus, text)
+	vStatus.TextColor3 = KIND_COLOR[kind] or C.text
 	dot.BackgroundColor3 = hatching and C.good or C.off
 
+	-- egg + live distance (recomputed every frame)
 	if target then
-		local name = target.id
-		if targetDist then
-			vTarget.Text = ("%s (%d studs) x%d"):format(name, math.floor(targetDist), target.amount or 1)
+		setText(vEgg, ("%s  x%d"):format(target.id, target.amount or 1))
+		local root = hrp()
+		if target.pos and root then
+			local d = (target.pos - root.Position).Magnitude
+			setText(vDist, ("%.1f studs"):format(d))
+			vDist.TextColor3 = d <= cfg.range and C.good or C.warn
 		else
-			vTarget.Text = ("%s (regular) x%d"):format(name, target.amount or 1)
+			setText(vDist, target.regular and "regular egg" or "-")
+			vDist.TextColor3 = C.dim
 		end
 	else
-		vTarget.Text = "none in range"
+		setText(vEgg, "none in range")
+		setText(vDist, "-")
+		vDist.TextColor3 = C.dim
 	end
 
-	vSession.Text = fmt(sessionHatched)
-	vTotal.Text = fmt(stats.total)
-	local label = (cfg.filter ~= "" and cfg.filter or "All eggs")
-	vGolden.Text = fmt(countFor(cfg.filter))
-	lGolden.Text = label
+	-- counters roll smoothly
+	shown.session = approach(shown.session, sessionHatched, dt, 10)
+	shown.total = approach(shown.total, stats.total, dt, 10)
+	shown.count = approach(shown.count, countFor(cfg.filter), dt, 10)
+	setText(vSession, fmt(shown.session))
+	setText(vTotal, fmt(shown.total))
+	setText(vCount, fmt(shown.count))
+	setText(lCount, cfg.filter ~= "" and cfg.filter or "All eggs")
 
-	local rate = computeRate()
-	if rate > 0 then
-		vRate.Text = ("%s / min"):format(fmt(rate * 60))
-		vProj.Text = "~" .. fmt(rate * 3600)
+	-- speed + projection: smoothed, glides, 3 significant digits
+	if warmSamples >= 3 or (not hatching and rateEMA > 0) then
+		shown.hour = approach(shown.hour, rateEMA * 3600, dt, 1.5)
+		shown.pace = approach(shown.pace, reqEMA, dt, 3)
+		setText(vRate, ("%s / min"):format(fmt(sig3(shown.hour / 60))))
+		setText(vProj, "~" .. fmt(sig3(shown.hour)))
+		setText(paceLabel, ("Pace: %d req/s"):format(math.floor(shown.pace + 0.5)))
 	else
-		vRate.Text = hatching and "measuring..." or "-"
-		vProj.Text = hatching and "measuring..." or "-"
+		local msg = hatching and "measuring..." or "-"
+		setText(vRate, msg)
+		setText(vProj, msg)
+		setText(paceLabel, "Pace: -")
 	end
+	paceLabel.TextColor3 = hatching and C.good or C.dim
 
 	if statsDirty and os.clock() - lastSave > 15 then
 		lastSave = os.clock()
@@ -805,7 +896,4 @@ task.spawn(function()
 	task.wait()
 	relayout()
 	main.Position = UDim2.new(0, 24, 0.5, -fullH / 2)
-	if not modulesReady then
-		setStatus("Loading game modules...", "warn")
-	end
 end)
